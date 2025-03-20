@@ -13,7 +13,7 @@ import math
 from tqdm import tqdm
 import pandas as pd
 # Initialize the Gemini client
-client = genai.Client(api_key="AIzaSyD3zssynpzRbxArxMa9ckWluiwEHtsC7uU")  # Replace with your actual key
+client = genai.Client(api_key="")  # Replace with your actual key
 
 def check_ffmpeg_installed():
     """Check if /vepfs-zulution/qiufeng/software/ffmpeg-7.0.2-amd64-static/ffmpeg is installed and available."""
