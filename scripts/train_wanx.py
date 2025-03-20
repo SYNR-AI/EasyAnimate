@@ -59,8 +59,9 @@ from tqdm.auto import tqdm
 from transformers import (AutoTokenizer, BertModel, BertTokenizer,
                           CLIPImageProcessor, CLIPVisionModelWithProjection,
                           Qwen2Tokenizer, Qwen2VLForConditionalGeneration,
-                          T5EncoderModel, T5Tokenizer)
+                          T5EncoderModel, T5Tokenizer, T5TokenizerFast, UMT5EncoderModel)
 from transformers.utils import ContextManagers
+
 import datasets
 
 current_file_path = os.path.abspath(__file__)
@@ -77,7 +78,6 @@ from easyanimate.data.bucket_sampler import (ASPECT_RATIO_512,
 from easyanimate.data.dataset_image_video import (ImageVideoDataset,
                                                   ImageVideoSampler,
                                                   get_random_mask)
-from easyanimate.utils.diffusion_utils import time_shift, get_lin_function
 from easyanimate.models import (name_to_autoencoder_magvit,
                                 name_to_transformer3d)
 from easyanimate.pipeline.pipeline_easyanimate import (
@@ -135,7 +135,7 @@ def encode_prompt(
     add_special_tokens = False,
     enable_text_attention_mask = True,
 ):
-    if type(tokenizer) in [BertTokenizer, T5Tokenizer]:
+    if type(tokenizer) in [BertTokenizer, T5Tokenizer, T5TokenizerFast]:
         if max_sequence_length is None:
             max_length = min(tokenizer.model_max_length, tokenizer_max_length)
         else:
@@ -824,7 +824,7 @@ def parse_args():
     parser.add_argument(
         "--weighting_scheme",
         type=str,
-        default="logit_normal",
+        default="none",
         choices=["sigma_sqrt", "logit_normal", "mode", "cosmap", "none"],
         help=('We default to the "none" weighting scheme for uniform sampling and uniform loss'),
     )
@@ -839,12 +839,6 @@ def parse_args():
         type=float,
         default=1.29,
         help="Scale of mode weighting scheme. Only effective when using the `'mode'` as the `weighting_scheme`.",
-    )
-    parser.add_argument(
-        "--flow_shift",
-        type=float,
-        default=None,
-        help="Flow shift of flow matching. Only effective when using the `'flow'` as the `loss_type`.",
     )
 
     args = parser.parse_args()
@@ -968,7 +962,7 @@ def main():
             )
         else:
             print("Init T5Tokenizer")
-            tokenizer = T5Tokenizer.from_pretrained(
+            tokenizer = AutoTokenizer.from_pretrained(
                 args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
             )
         tokenizer_2 = None
@@ -1015,7 +1009,7 @@ def main():
                     torch_dtype=weight_dtype,
                 )
             else:
-                text_encoder = T5EncoderModel.from_pretrained(
+                text_encoder = UMT5EncoderModel.from_pretrained(
                     args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant,
                     torch_dtype=weight_dtype
                 )
@@ -1026,21 +1020,18 @@ def main():
             config['vae_kwargs'].get('vae_type', 'AutoencoderKL')
         ]
         vae = Choosen_AutoencoderKL.from_pretrained(
-            args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant,
-            vae_additional_kwargs=OmegaConf.to_container(config['vae_kwargs'])
-        )
-
+            args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant)
+        vae.cache_mag_vae = True
+        vae.mini_batch_encoder = 4
     # Get Transformer
     Choosen_Transformer3DModel = name_to_transformer3d[
         config['transformer_additional_kwargs'].get('transformer_type', 'Transformer3DModel')
     ]
-    transformer3d = Choosen_Transformer3DModel.from_pretrained_2d(
-        args.pretrained_model_name_or_path, subfolder="transformer",
-        transformer_additional_kwargs=OmegaConf.to_container(config['transformer_additional_kwargs'])
-    )
+    transformer3d = Choosen_Transformer3DModel.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="transformer")
 
     # Get Image encoder
-    if args.train_mode != "normal" and config['transformer_additional_kwargs'].get('enable_clip_in_inpaint', True):
+    if args.train_mode != "normal" and config['transformer_additional_kwargs'].get('enable_clip_in_inpaint', False):
         image_encoder = CLIPVisionModelWithProjection.from_pretrained(
             args.pretrained_model_name_or_path, subfolder="image_encoder"
         )
@@ -1835,7 +1826,16 @@ def main():
                             latents = _batch_encode_vae(pixel_values)
                     else:
                         latents = _batch_encode_vae(pixel_values)
-                    latents = latents * vae.config.scaling_factor
+
+                    latents_mean = (
+                        torch.tensor(vae.config.latents_mean)
+                        .view(1, vae.config.z_dim, 1, 1, 1)
+                        .to(latents.device, latents.dtype)
+                    )
+                    latents_std = 1.0 / torch.tensor(vae.config.latents_std).view(1, vae.config.z_dim, 1, 1, 1).to(
+                        latents.device, latents.dtype
+                    )
+                    latents = (latents - latents_mean) * latents_std
 
                     if args.train_mode != "normal":
                         # Encode masks.
@@ -1972,27 +1972,8 @@ def main():
                     height, width = batch["pixel_values"].size()[-2], batch["pixel_values"].size()[-1]
 
                     # Get 3D rope or 2d rope
-                    grid_height = height // 8 // unwrap_model(transformer3d).config.patch_size
-                    grid_width = width // 8 // unwrap_model(transformer3d).config.patch_size
-                    if unwrap_model(transformer3d).config.get("time_position_encoding_type", "2d_rope") == "3d_rope":
-                        base_size_width = 720 // 8 // unwrap_model(transformer3d).config.patch_size
-                        base_size_height = 480 // 8 // unwrap_model(transformer3d).config.patch_size
-                        grid_crops_coords = get_resize_crop_region_for_grid(
-                            (grid_height, grid_width), base_size_width, base_size_height
-                        )
-                        image_rotary_emb = _get_3d_rotary_pos_embed_cached(
-                            unwrap_model(transformer3d).config.attention_head_dim,
-                            grid_crops_coords, (grid_height, grid_width), latents.size()[2],
-                        )
-                    else:
-                        base_size = 512 // 8 // unwrap_model(transformer3d).config.patch_size
-                        grid_crops_coords = get_resize_crop_region_for_grid(
-                            (grid_height, grid_width), base_size, base_size
-                        )
-                        image_rotary_emb = _get_2d_rotary_pos_embed_cached(
-                            unwrap_model(transformer3d).config.attention_head_dim,
-                            grid_crops_coords, (grid_height, grid_width)
-                        )
+                    grid_height = height // 8 // unwrap_model(transformer3d).config.patch_size[1]
+                    grid_width = width // 8 // unwrap_model(transformer3d).config.patch_size[2]
 
                     # Get other hunyuan params
                     style = torch.tensor([0], device=latents.device)
@@ -2021,29 +2002,13 @@ def main():
                         else:
                             raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
                     else:
-                        def get_sigmas(timesteps, n_dim=4, dtype=torch.float32, flow_shift='auto', spatial_token_length=1024):
+                        def get_sigmas(timesteps, n_dim=4, dtype=torch.float32):
                             sigmas = noise_scheduler.sigmas.to(device=accelerator.device, dtype=dtype)
                             schedule_timesteps = noise_scheduler.timesteps.to(accelerator.device)
                             timesteps = timesteps.to(accelerator.device)
                             step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
 
                             sigma = sigmas[step_indices].flatten()
-
-                            if args.flow_shift is not None:
-                                lower_bound = 0.05
-                                upper_bound = 0.99
-                                clamped = torch.clamp(sigma, lower_bound, upper_bound)
-                                sigma = (clamped - lower_bound) / (upper_bound - lower_bound)
-
-                            if flow_shift == 'auto':
-                                mu = get_lin_function(y1=0.5, y2=1.15)(spatial_token_length)
-                                sigma = time_shift(mu, 1.0, sigma)
-
-                            elif isinstance(flow_shift, float) or isinstance(flow_shift, int):
-                                sigma = (sigma * flow_shift) / (1 + (flow_shift - 1) * sigma)
-                            else:
-                                pass
-
                             while len(sigma.shape) < n_dim:
                                 sigma = sigma.unsqueeze(-1)
                             return sigma
@@ -2060,7 +2025,7 @@ def main():
 
                         # Add noise according to flow matching.
                         # zt = (1 - texp) * x + texp * z1
-                        sigmas = get_sigmas(timesteps, n_dim=latents.ndim, flow_shift=args.flow_shift, dtype=latents.dtype, spatial_token_length=latents.shape[3]*latents.shape[4])
+                        sigmas = get_sigmas(timesteps, n_dim=latents.ndim, dtype=latents.dtype)
                         noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
 
                         # Add noise
@@ -2069,20 +2034,20 @@ def main():
                     # Predict the noise residual
                     noise_pred = transformer3d(
                         noisy_latents,
-                        1000*sigmas[:,0,0,0,0].to(noisy_latents.dtype) if args.loss_type == "flow" else timesteps.to(noisy_latents.dtype),
+                        timesteps.to(noisy_latents.dtype),
                         encoder_hidden_states=prompt_embeds,
-                        text_embedding_mask=prompt_attention_mask,
-                        encoder_hidden_states_t5=prompt_embeds_2,
-                        text_embedding_mask_t5=prompt_attention_mask_2,
-                        image_meta_size=add_time_ids,
-                        style=style,
-                        image_rotary_emb=image_rotary_emb,
-                        inpaint_latents=inpaint_latents if args.train_mode != "normal" else None,
-                        clip_encoder_hidden_states=clip_encoder_hidden_states if args.train_mode != "normal" else None,
-                        clip_attention_mask=clip_attention_mask if args.train_mode != "normal" else None,
+                        # text_embedding_mask=prompt_attention_mask,
+                        # encoder_hidden_states_t5=prompt_embeds_2,
+                        # text_embedding_mask_t5=prompt_attention_mask_2,
+                        # image_meta_size=add_time_ids,
+                        # style=style,
+                        # image_rotary_emb=image_rotary_emb,
+                        # inpaint_latents=inpaint_latents if args.train_mode != "normal" else None,
+                        # clip_encoder_hidden_states=clip_encoder_hidden_states if args.train_mode != "normal" else None,
+                        # clip_attention_mask=clip_attention_mask if args.train_mode != "normal" else None,
                         return_dict=False
                     )[0]
-                    if noise_pred.size()[1] != vae.config.latent_channels:
+                    if noise_pred.size()[1] != vae.config.z_dim:
                         noise_pred, _ = noise_pred.chunk(2, dim=1)
 
                     def custom_mse_loss(noise_pred, target, weighting=None, threshold=50):

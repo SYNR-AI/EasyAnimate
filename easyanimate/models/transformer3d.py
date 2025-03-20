@@ -22,6 +22,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
+from deepspeed.pipe import LayerSpec, PipelineModule, TiedLayerSpec
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.attention import BasicTransformerBlock
 from diffusers.models.embeddings import (PatchEmbed, PixArtAlphaTextProjection,
@@ -1490,9 +1491,6 @@ class EasyAnimateTransformer3DModel(ModelMixin, ConfigMixin):
     ):
         self.teacache = TeaCache(coefficients, num_steps, rel_l1_thresh=rel_l1_thresh)
 
-    def _set_gradient_checkpointing(self, module, value=False):
-        self.gradient_checkpointing = value
-
     def forward(
         self,
         hidden_states,
@@ -1807,3 +1805,137 @@ class EasyAnimateTransformer3DModel(ModelMixin, ConfigMixin):
         
         model = model.to(torch_dtype)
         return model
+    
+
+class EasyAnimateTransformer3DModelPipe(PipelineModule):
+    def __init__(self, original_model, num_stages=4):
+        # 计算每个stage包含的transformer块数
+        self.config = original_model.config
+        num_blocks = len(original_model.transformer_blocks)
+        blocks_per_stage = num_blocks // num_stages
+        
+        specs = [
+            # 预处理阶段
+            LayerSpec(PreprocessStage, original_model),
+            
+            # Transformer块阶段
+            *[LayerSpec(TransformerStage, 
+                       original_model.transformer_blocks[i*blocks_per_stage:(i+1)*blocks_per_stage])
+              for i in range(num_stages)],
+            
+            # 后处理阶段
+            LayerSpec(PostprocessStage, original_model)
+        ]
+
+        super().__init__(
+            layers=specs, num_stages=num_stages
+        )
+    @classmethod
+    def from_pretrained_2d(cls, pretrained_model_path, subfolder="transformer", transformer_additional_kwargs=None, num_stages=4):
+        original_model = EasyAnimateTransformer3DModel.from_pretrained_2d(pretrained_model_path, subfolder, transformer_additional_kwargs)
+        return cls(original_model, num_stages)
+    
+    def enable_gradient_checkpointing(self):
+        pass
+    
+class PreprocessStage(nn.Module):
+    def __init__(self, original_model):
+        super().__init__()
+        self.original_model = original_model
+        self.time_proj = original_model.time_proj
+        self.time_embedding = original_model.time_embedding
+        self.proj = original_model.proj
+        self.text_proj = original_model.text_proj
+        self.ref_proj = original_model.ref_proj if hasattr(original_model, 'ref_proj') else None
+        self.clip_proj = original_model.clip_proj if hasattr(original_model, 'clip_proj') else None
+
+    def forward(self, inputs):
+        # 解包输入
+        hidden_states, timestep, encoder_hidden_states, ref_latents, clip_encoder_hidden_states = inputs
+        
+        # 1. 时间嵌入
+        temb = self.time_proj(timestep)
+        temb = self.time_embedding(temb, None)
+        
+        # 2. Patch嵌入
+        batch_size, channels, video_length, height, width = hidden_states.size()
+        hidden_states = rearrange(hidden_states, "b c f h w -> (b f) c h w")
+        hidden_states = self.proj(hidden_states)
+        hidden_states = rearrange(hidden_states, "(b f) c h w -> b (f h w) c", f=video_length)
+        
+        # 3. 文本投影
+        encoder_hidden_states = self.text_proj(encoder_hidden_states)
+        
+        # 4. Ref处理
+        if ref_latents is not None and self.ref_proj is not None:
+            ref_latents = rearrange(ref_latents, "b c f h w -> (b f) c h w")
+            ref_latents = self.ref_proj(ref_latents)
+            ref_latents = rearrange(ref_latents, "(b f) c h w -> b (f h w) c", f=video_length)
+            
+        # 5. Clip处理
+        if clip_encoder_hidden_states is not None and self.clip_proj is not None:
+            clip_encoder_hidden_states = self.clip_proj(clip_encoder_hidden_states)
+        
+        return (hidden_states, encoder_hidden_states, temb, ref_latents, clip_encoder_hidden_states)
+
+class TransformerStage(nn.Module):
+    def __init__(self, blocks):
+        super().__init__()
+        self.blocks = nn.ModuleList(blocks)
+        
+    def forward(self, inputs):
+        hidden_states, encoder_hidden_states, temb, ref_latents, clip_encoder_hidden_states = inputs
+        
+        # 合并参考和clip特征
+        if ref_latents is not None:
+            encoder_hidden_states = torch.cat([encoder_hidden_states, ref_latents], dim=1)
+        if clip_encoder_hidden_states is not None:
+            encoder_hidden_states = torch.cat([encoder_hidden_states, clip_encoder_hidden_states], dim=1)
+        
+        # 执行所有transformer块
+        for block in self.blocks:
+            hidden_states, encoder_hidden_states = block(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                temb=temb,
+                image_rotary_emb=None,  # 根据实际情况调整
+                num_frames=1,          # 根据实际情况调整
+                height=1,              # 根据实际情况调整
+                width=1                # 根据实际情况调整
+            )
+        
+        return (hidden_states, encoder_hidden_states, temb, None, None)
+
+class PostprocessStage(nn.Module):
+    def __init__(self, original_model):
+        super().__init__()
+        self.original_model = original_model
+        self.norm_final = original_model.norm_final
+        self.norm_out = original_model.norm_out
+        self.proj_out = original_model.proj_out
+        self.patch_size = original_model.patch_size
+
+    def forward(self, inputs):
+        hidden_states, encoder_hidden_states, temb, _, _ = inputs
+        
+        # 1. 合并特征
+        hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+        hidden_states = self.norm_final(hidden_states)
+        hidden_states = hidden_states[:, encoder_hidden_states.size(1):]
+        
+        # 2. 最终归一化
+        hidden_states = self.norm_out(hidden_states, temb=temb)
+        
+        # 3. 投影输出
+        hidden_states = self.proj_out(hidden_states)
+        
+        # 4. Unpatchify
+        p = self.patch_size
+        output = hidden_states.reshape(
+            hidden_states.size(0), 
+            -1, 
+            hidden_states.size(1) // (p * p),
+            p,
+            p
+        )
+        return output

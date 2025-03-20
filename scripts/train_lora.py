@@ -62,7 +62,6 @@ from transformers import (Qwen2Tokenizer, AutoTokenizer, BertModel,
                           Qwen2VLForConditionalGeneration, T5EncoderModel,
                           T5Tokenizer)
 from transformers.utils import ContextManagers
-
 import datasets
 
 current_file_path = os.path.abspath(__file__)
@@ -78,6 +77,7 @@ from easyanimate.data.bucket_sampler import (ASPECT_RATIO_512,
 from easyanimate.data.dataset_image_video import (ImageVideoDataset,
                                                   ImageVideoSampler,
                                                   get_random_mask)
+from easyanimate.utils.diffusion_utils import time_shift, get_lin_function
 from easyanimate.models import (name_to_autoencoder_magvit,
                                 name_to_transformer3d)
 from easyanimate.pipeline.pipeline_easyanimate import (
@@ -99,12 +99,12 @@ rotary_pos_embed_cache = {}
 
 def _get_2d_rotary_pos_embed_cached(embed_dim, crops_coords, grid_size):
     tmp_key = (embed_dim, crops_coords, grid_size)
-    print('embed_dim=%d crops_coords=%s grid_size=%s in_cache=%d cache_size=%d' % (
-        embed_dim, crops_coords, grid_size, tmp_key in rotary_pos_embed_cache, len(rotary_pos_embed_cache)))
+    # print('embed_dim=%d crops_coords=%s grid_size=%s in_cache=%d cache_size=%d' % (
+    #     embed_dim, crops_coords, grid_size, tmp_key in rotary_pos_embed_cache, len(rotary_pos_embed_cache)))
     if tmp_key not in rotary_pos_embed_cache:
         tmp_embed = get_2d_rotary_pos_embed(embed_dim, crops_coords, grid_size)
         tmp_embed_gpu = (tmp_embed[0].cuda(), tmp_embed[1].cuda())
-        print('\tembed_dim=%d data_size=%s' % (embed_dim, tmp_embed[0].shape))
+        # print('\tembed_dim=%d data_size=%s' % (embed_dim, tmp_embed[0].shape))
         rotary_pos_embed_cache[tmp_key] = tmp_embed_gpu
         return tmp_embed_gpu
     else:
@@ -112,15 +112,15 @@ def _get_2d_rotary_pos_embed_cached(embed_dim, crops_coords, grid_size):
 
 def _get_3d_rotary_pos_embed_cached(embed_dim, crops_coords, grid_size, temporal_size):
     tmp_key = (embed_dim, crops_coords, grid_size, temporal_size)
-    print('embed_dim=%d crops_coords=%s grid_size=%s in_cache=%d cache_size=%d' % (
-        embed_dim, crops_coords, grid_size, tmp_key in rotary_pos_embed_cache, len(rotary_pos_embed_cache)))
+    # print('embed_dim=%d crops_coords=%s grid_size=%s in_cache=%d cache_size=%d' % (
+    #     embed_dim, crops_coords, grid_size, tmp_key in rotary_pos_embed_cache, len(rotary_pos_embed_cache)))
     if tmp_key not in rotary_pos_embed_cache:
         tmp_embed = get_3d_rotary_pos_embed(
             embed_dim, crops_coords, grid_size=grid_size,
             temporal_size=temporal_size, use_real=True,
         )
         tmp_embed_gpu = (tmp_embed[0].cuda(), tmp_embed[1].cuda())
-        print('\tembed_dim=%d data_size=%s' % (embed_dim, tmp_embed[0].shape))
+        # print('\tembed_dim=%d data_size=%s' % (embed_dim, tmp_embed[0].shape))
         rotary_pos_embed_cache[tmp_key] = tmp_embed_gpu
         return tmp_embed_gpu
     else:
@@ -843,7 +843,7 @@ def parse_args():
     parser.add_argument(
         "--weighting_scheme",
         type=str,
-        default="none",
+        default="logit_normal",
         choices=["sigma_sqrt", "logit_normal", "mode", "cosmap", "none"],
         help=('We default to the "none" weighting scheme for uniform sampling and uniform loss'),
     )
@@ -858,6 +858,13 @@ def parse_args():
         type=float,
         default=1.29,
         help="Scale of mode weighting scheme. Only effective when using the `'mode'` as the `weighting_scheme`.",
+    )
+
+    parser.add_argument(
+        "--flow_shift",
+        type=float,
+        default=None,
+        help="Flow shift of flow matching. Only effective when using the `'flow'` as the `loss_type`.",
     )
 
     args = parser.parse_args()
@@ -1934,13 +1941,26 @@ def main():
                         else:
                             raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
                     else:
-                        def get_sigmas(timesteps, n_dim=4, dtype=torch.float32):
+                        def get_sigmas(timesteps, n_dim=4, dtype=torch.float32, flow_shift='auto', spatial_token_length=1024):
                             sigmas = noise_scheduler.sigmas.to(device=accelerator.device, dtype=dtype)
                             schedule_timesteps = noise_scheduler.timesteps.to(accelerator.device)
                             timesteps = timesteps.to(accelerator.device)
                             step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
 
                             sigma = sigmas[step_indices].flatten()
+                            if flow_shift is not None:
+                                lower_bound = 0.05
+                                upper_bound = 0.99
+                                clamped = torch.clamp(sigma, lower_bound, upper_bound)
+                                sigma = (clamped - lower_bound) / (upper_bound - lower_bound)
+                            if flow_shift == 'auto':
+                                mu = get_lin_function(y1=0.5, y2=1.15)(spatial_token_length)
+                                sigma = time_shift(mu, 1.0, sigma)
+                            elif isinstance(flow_shift, float) or isinstance(flow_shift, int):
+                                sigma = (sigma * flow_shift) / (1 + (flow_shift - 1) * sigma)
+                            else:
+                                pass
+
                             while len(sigma.shape) < n_dim:
                                 sigma = sigma.unsqueeze(-1)
                             return sigma
@@ -1957,7 +1977,7 @@ def main():
 
                         # Add noise according to flow matching.
                         # zt = (1 - texp) * x + texp * z1
-                        sigmas = get_sigmas(timesteps, n_dim=latents.ndim, dtype=latents.dtype)
+                        sigmas = get_sigmas(timesteps, n_dim=latents.ndim, flow_shift=args.flow_shift, dtype=latents.dtype, spatial_token_length=latents.shape[3]*latents.shape[4])
                         noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
 
                         # Add noise
@@ -1966,7 +1986,7 @@ def main():
                     # Predict the noise residual
                     noise_pred = transformer3d(
                         noisy_latents,
-                        timesteps.to(noisy_latents.dtype),
+                        1000*sigmas[:,0,0,0,0].to(noisy_latents.dtype),
                         encoder_hidden_states=prompt_embeds,
                         text_embedding_mask=prompt_attention_mask,
                         encoder_hidden_states_t5=prompt_embeds_2,

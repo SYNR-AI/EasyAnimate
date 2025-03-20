@@ -343,7 +343,7 @@ class EasyAnimateController:
             gr.Info(f"Please select a pretrained model path.")
             return gr.update(value=None)
         else:
-            base_model_dropdown = os.path.join(self.personalized_model_dir, base_model_dropdown)
+            # base_model_dropdown = os.path.join(self.personalized_model_dir, base_model_dropdown)
             print(f"From checkpoint: {base_model_dropdown}")
             if base_model_dropdown.endswith("safetensors"):
                 from safetensors.torch import load_file, safe_open
@@ -361,7 +361,6 @@ class EasyAnimateController:
         if lora_model_dropdown == "none":
             self.lora_model_path = "none"
             return gr.update()
-        lora_model_dropdown = os.path.join(self.personalized_model_dir, lora_model_dropdown)
         self.lora_model_path = lora_model_dropdown
         return gr.update()
 
@@ -746,7 +745,7 @@ def ui(GPU_memory_mode, enable_teacache, teacache_threshold, weight_dtype):
             with gr.Row():
                 motion_module_dropdown = gr.Dropdown(
                     label="Select motion module (选择运动模块[非必需])",
-                    choices=controller.motion_module_list,
+                    choices=['none'],
                     value="none",
                     interactive=True,
                     visible=False
@@ -758,16 +757,14 @@ def ui(GPU_memory_mode, enable_teacache, teacache_threshold, weight_dtype):
                     return gr.update(choices=controller.motion_module_list)
                 motion_module_refresh_button.click(fn=update_motion_module, inputs=[], outputs=[motion_module_dropdown])
                 
-                base_model_dropdown = gr.Dropdown(
+                base_model_dropdown = gr.Textbox(
                     label="Select base Dreambooth model (选择基模型[非必需])",
-                    choices=controller.personalized_model_list,
                     value="none",
                     interactive=True,
                 )
                 
-                lora_model_dropdown = gr.Dropdown(
+                lora_model_dropdown = gr.Textbox(
                     label="Select LoRA model (选择LoRA模型[非必需])",
-                    choices=["none"] + controller.personalized_model_list,
                     value="none",
                     interactive=True,
                 )
@@ -1192,7 +1189,6 @@ class EasyAnimateController_Modelscope:
         if lora_model_dropdown == "none":
             self.lora_model_path = "none"
             return gr.update()
-        lora_model_dropdown = os.path.join(self.personalized_model_dir, lora_model_dropdown)
         self.lora_model_path = lora_model_dropdown
         return gr.update()
     

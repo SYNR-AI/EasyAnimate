@@ -5,7 +5,7 @@
 
 import numpy as np
 import torch as th
-
+import math
 
 def normal_kl(mean1, logvar1, mean2, logvar2):
     """
@@ -90,3 +90,16 @@ def discretized_gaussian_log_likelihood(x, *, means, log_scales):
     )
     assert log_probs.shape == x.shape
     return log_probs
+
+
+
+def time_shift(mu: float, sigma: float, t):
+    return math.exp(mu) / (math.exp(mu) + (1 / t - 1) ** sigma)
+
+
+def get_lin_function(
+    x1: float = 256, y1: float = 0.5, x2: float = 4096, y2: float = 1.15
+):
+    m = (y2 - y1) / (x2 - x1)
+    b = y1 - m * x1
+    return lambda x: m * x + b

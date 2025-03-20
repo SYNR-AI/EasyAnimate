@@ -1,0 +1,9 @@
+transformer_additional_kwargs:
+  transformer_type:                           "WanModel"
+
+vae_kwargs:
+  vae_type: "WanVAE"
+
+text_encoder_kwargs:
+  enable_multi_text_encoder: false
+  replace_t5_to_llm: false
